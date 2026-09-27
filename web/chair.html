@@ -1,0 +1,48 @@
+<!doctype html>
+<html lang="zh-CN"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1"><title>主席工作台 · 评审分配</title>
+<style>body{font:16px system-ui;max-width:1100px;margin:32px auto;padding:0 16px}input,select,button{font:inherit;padding:6px;margin:2px}.panel{border:1px solid #bbb;padding:16px;border-radius:8px;margin-bottom:16px}table{border-collapse:collapse;width:100%;margin-top:8px}td,th{border:1px solid #ccc;padding:6px;text-align:left;vertical-align:top}.ok{color:#087008}.bad{color:#a40000}.muted{color:#666}</style></head>
+<body><h1>主席工作台</h1>
+<p>为每篇论文设定评审起止日期；只有评审人整个时段无忙碌且未满负载，才能发出邀请。接受后若新增冲突休假，分配会被释放并回到待补位列表。<a href="/">返回投稿页</a></p>
+<section class="panel"><h2>论文与评审时段</h2><button onclick="loadAll()">刷新</button><div id="papers"></div></section>
+<section class="panel"><h2>待补位论文与候选</h2><div id="backfill"></div></section>
+<section class="panel"><h2>评审人忙碌区间</h2><div id="busy"></div></section>
+<script>
+const headers={"Content-Type":"application/json","X-User-Id":"chair"};
+function esc(s){return String(s??"").replace(/[&<>"']/g,c=>({"&":"&amp;","<":"&lt;",">":"&gt;",'"':"&quot;","'":"&#39;"}[c]))}
+async function api(url,opt={}){const r=await fetch(url,{...opt,headers});const j=await r.json();if(!r.ok){alert((j.error&&j.error.message)||r.status);throw new Error((j.error&&j.error.code)||"error")}return j}
+async function loadPapers(){
+  const {items}=await api("/api/papers");
+  document.querySelector("#papers").innerHTML="<table><tr><th>ID</th><th>标题</th><th>状态</th><th>评审开始</th><th>评审结束</th><th></th></tr>"+
+    items.map(p=>`<tr><td>${p.id}</td><td>${esc(p.title)}</td><td>${esc(p.status)}</td>`+
+      `<td><input type="date" id="s${p.id}" value="${p.review_start??""}"></td>`+
+      `<td><input type="date" id="e${p.id}" value="${p.review_end??""}"></td>`+
+      `<td><button onclick="savePeriod(${p.id})">保存时段</button></td></tr>`).join("")+"</table>";
+}
+async function loadBackfill(){
+  const data=await api("/api/chair/backfill");
+  const rows=data.items.filter(i=>i.needs_backfill);
+  document.querySelector("#backfill").innerHTML=rows.length?rows.map(i=>
+    `<h3>#${i.paper_id} ${esc(i.title)} <span class="muted">${i.review_start??"?"} ~ ${i.review_end??"?"}</span></h3>`+
+    `<p>进行中 ${i.active} · 已完成 ${i.completed} · 已释放 ${i.released} · 每篇需 ${i.required} 人，<b class="bad">缺 ${i.shortage} 人</b></p>`+
+    `<table><tr><th>评审人</th><th>负载</th><th>结论 / 排除原因</th><th></th></tr>`+
+    i.candidates.map(c=>`<tr><td>${esc(c.name)}</td><td>${c.load}/${c.load_limit}</td>`+
+      `<td>${c.eligible?'<span class="ok">可邀请</span>':c.excluded_reasons.map(r=>esc(r.message)).join("；")}</td>`+
+      `<td>${c.eligible?`<button onclick="invite(${i.paper_id},'${c.reviewer_id}')">邀请</button>`:""}</td></tr>`).join("")+
+    `</table>`).join(""):'<p class="ok">没有待补位论文。</p>';
+}
+async function loadBusy(){
+  const {items}=await api("/api/busy-intervals");
+  document.querySelector("#busy").innerHTML=items.length?
+    "<table><tr><th>评审人</th><th>开始</th><th>结束</th><th>事由</th></tr>"+
+    items.map(b=>`<tr><td>${esc(b.reviewer_id)}</td><td>${b.start_date}</td><td>${b.end_date}</td><td>${esc(b.reason)}</td></tr>`).join("")+"</table>":
+    '<p class="muted">暂无忙碌区间。</p>';
+}
+async function savePeriod(id){
+  const r=await api(`/api/papers/${id}/review-period`,{method:"POST",body:JSON.stringify({start:document.querySelector("#s"+id).value,end:document.querySelector("#e"+id).value})});
+  if(r.released_assignment_ids&&r.released_assignment_ids.length)alert(`时段已保存；${r.released_assignment_ids.length} 个进行中的分配因休假冲突被释放`);
+  await loadAll();
+}
+async function invite(pid,rid){await api(`/api/papers/${pid}/assignments`,{method:"POST",body:JSON.stringify({reviewer_id:rid})});await loadAll()}
+async function loadAll(){await Promise.all([loadPapers(),loadBackfill(),loadBusy()])}
+loadAll().catch(e=>console.error(e));
+</script></body></html>

@@ -6,31 +6,25 @@ import hashlib
 import json
 import sqlite3
 import threading
-from datetime import datetime, timezone
 from http import HTTPStatus
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
-from urllib.parse import urlparse
+from urllib.parse import parse_qs, urlparse
+
+from assignments import AssignmentOps
+from availability import utcnow
+from errors import BusinessError
 
 BASE_DIR = Path(__file__).resolve().parent
 DEFAULT_DB = BASE_DIR / "review.db"
 VALID_DECISIONS = {"accept", "reject", "minor_revision", "major_revision"}
 
 
-class BusinessError(Exception):
-    def __init__(self, message: str, status: int = 400, code: str = "bad_request"):
-        super().__init__(message)
-        self.message = message
-        self.status = status
-        self.code = code
+class ReviewStore(AssignmentOps):
+    """领域逻辑。每个公开方法使用独立连接，避免 HTTP 线程共享 SQLite 连接。
 
-
-def utcnow() -> str:
-    return datetime.now(timezone.utc).isoformat(timespec="seconds")
-
-
-class ReviewStore:
-    """领域逻辑。每个公开方法使用独立连接，避免 HTTP 线程共享 SQLite 连接。"""
+    评审时段、忙碌区间与分配事务在 assignments.py；时段纯规则在 availability.py。
+    """
 
     def __init__(self, db_path: str | Path = DEFAULT_DB):
         self.db_path = str(db_path)
@@ -60,6 +54,8 @@ class ReviewStore:
                     abstract TEXT NOT NULL,
                     status TEXT NOT NULL DEFAULT 'submitted'
                         CHECK (status IN ('submitted','under_review','decided','withdrawn')),
+                    review_start TEXT,
+                    review_end TEXT,
                     created_at TEXT NOT NULL
                 );
                 CREATE TABLE IF NOT EXISTS paper_versions (
@@ -94,9 +90,19 @@ class ReviewStore:
                         CHECK (status IN ('invited','accepted','declined','completed')),
                     score INTEGER CHECK (score IS NULL OR score BETWEEN 1 AND 5),
                     review_text TEXT,
+                    released_at TEXT,
                     created_at TEXT NOT NULL,
                     updated_at TEXT NOT NULL,
                     UNIQUE (paper_id, reviewer_id)
+                );
+                CREATE TABLE IF NOT EXISTS busy_intervals (
+                    id INTEGER PRIMARY KEY AUTOINCREMENT,
+                    reviewer_id TEXT NOT NULL REFERENCES users(id),
+                    start_date TEXT NOT NULL,
+                    end_date TEXT NOT NULL,
+                    reason TEXT NOT NULL DEFAULT '',
+                    created_at TEXT NOT NULL,
+                    CHECK (start_date <= end_date)
                 );
                 CREATE TABLE IF NOT EXISTS rebuttals (
                     id INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -124,6 +130,16 @@ class ReviewStore:
                 );
                 """
             )
+            # 兼容旧库：为已存在的表补充新列。
+            self._ensure_column(conn, "papers", "review_start", "TEXT")
+            self._ensure_column(conn, "papers", "review_end", "TEXT")
+            self._ensure_column(conn, "assignments", "released_at", "TEXT")
+
+    @staticmethod
+    def _ensure_column(conn: sqlite3.Connection, table: str, column: str, ddl: str) -> None:
+        cols = {row["name"] for row in conn.execute(f"PRAGMA table_info({table})")}
+        if column not in cols:
+            conn.execute(f"ALTER TABLE {table} ADD COLUMN {column} {ddl}")
 
     def seed(self) -> None:
         self.init_schema()
@@ -185,6 +201,8 @@ class ReviewStore:
             "title": paper["title"],
             "abstract": paper["abstract"],
             "status": paper["status"],
+            "review_start": paper["review_start"],
+            "review_end": paper["review_end"],
             "created_at": paper["created_at"],
         }
         if viewer["role"] == "chair" or viewer["id"] == paper["author_id"]:
@@ -265,74 +283,6 @@ class ReviewStore:
             )
             self._audit(conn, paper_id, reviewer_id, "bid.set", {"interest": interest, "note": note.strip()})
             return {"paper_id": paper_id, "reviewer_id": reviewer_id, "interest": interest}
-
-    def assign(self, chair_id: str, paper_id: int, reviewer_id: str) -> dict:
-        with self.connect() as conn:
-            chair = self._user(conn, chair_id)
-            self._require(chair, "chair")
-            try:
-                conn.execute("BEGIN IMMEDIATE")
-                paper = conn.execute("SELECT * FROM papers WHERE id=?", (paper_id,)).fetchone()
-                if not paper or paper["status"] not in {"submitted", "under_review"}:
-                    raise BusinessError("论文不存在或不可分配", 409, "paper_unavailable")
-                reviewer = self._user(conn, reviewer_id)
-                self._require(reviewer, "reviewer")
-                if conn.execute("SELECT 1 FROM conflicts WHERE reviewer_id=? AND paper_id=?", (reviewer_id, paper_id)).fetchone():
-                    raise BusinessError("评审人与论文存在利益冲突", 409, "conflict_of_interest")
-                load = conn.execute(
-                    "SELECT COUNT(*) FROM assignments WHERE reviewer_id=? AND status IN ('invited','accepted')",
-                    (reviewer_id,),
-                ).fetchone()[0]
-                if load >= reviewer["load_limit"]:
-                    raise BusinessError("评审人已达到负载上限", 409, "reviewer_at_capacity")
-                try:
-                    cur = conn.execute(
-                        "INSERT INTO assignments(paper_id,reviewer_id,created_at,updated_at) VALUES(?,?,?,?)",
-                        (paper_id, reviewer_id, utcnow(), utcnow()),
-                    )
-                except sqlite3.IntegrityError:
-                    raise BusinessError("该评审人已被分配此论文", 409, "assignment_exists")
-                conn.execute("UPDATE papers SET status='under_review' WHERE id=?", (paper_id,))
-                assignment_id = cur.lastrowid
-                self._audit(conn, paper_id, chair_id, "assignment.invite", {"assignment_id": assignment_id, "reviewer_id": reviewer_id})
-                return {"id": assignment_id, "paper_id": paper_id, "reviewer_id": reviewer_id, "status": "invited"}
-            except Exception:
-                conn.rollback()
-                raise
-
-    def respond_assignment(self, reviewer_id: str, assignment_id: int, accepted: bool) -> dict:
-        with self.connect() as conn:
-            reviewer = self._user(conn, reviewer_id)
-            self._require(reviewer, "reviewer")
-            row = conn.execute("SELECT * FROM assignments WHERE id=?", (assignment_id,)).fetchone()
-            if not row or row["reviewer_id"] != reviewer_id:
-                raise BusinessError("分配不存在或不属于当前评审人", 404, "not_found")
-            if row["status"] != "invited":
-                raise BusinessError("邀请已经处理", 409, "invitation_already_answered")
-            status = "accepted" if accepted else "declined"
-            conn.execute("UPDATE assignments SET status=?,updated_at=? WHERE id=?", (status, utcnow(), assignment_id))
-            self._audit(conn, row["paper_id"], reviewer_id, "assignment.respond", {"assignment_id": assignment_id, "status": status})
-            return {"id": assignment_id, "status": status}
-
-    def submit_review(self, reviewer_id: str, assignment_id: int, score: int, text: str) -> dict:
-        if isinstance(score, bool) or not isinstance(score, int) or not 1 <= score <= 5:
-            raise BusinessError("评分必须是 1 到 5 的整数", 422, "invalid_score")
-        if len(text.strip()) < 10:
-            raise BusinessError("评审意见至少 10 字", 422, "review_too_short")
-        with self.connect() as conn:
-            reviewer = self._user(conn, reviewer_id)
-            self._require(reviewer, "reviewer")
-            row = conn.execute("SELECT * FROM assignments WHERE id=?", (assignment_id,)).fetchone()
-            if not row or row["reviewer_id"] != reviewer_id:
-                raise BusinessError("分配不存在或不属于当前评审人", 404, "not_found")
-            if row["status"] != "accepted":
-                raise BusinessError("只有已接受邀请的评审人可以提交评审", 409, "invalid_assignment_state")
-            conn.execute(
-                "UPDATE assignments SET status='completed',score=?,review_text=?,updated_at=? WHERE id=?",
-                (score, text.strip(), utcnow(), assignment_id),
-            )
-            self._audit(conn, row["paper_id"], reviewer_id, "review.submit", {"assignment_id": assignment_id, "score": score})
-            return {"id": assignment_id, "status": "completed", "score": score}
 
     def submit_rebuttal(self, author_id: str, paper_id: int, content: str) -> dict:
         if len(content.strip()) < 10:
@@ -417,8 +367,9 @@ class ReviewHandler(BaseHTTPRequestHandler):
     def _dispatch(self, method: str) -> None:
         parsed = urlparse(self.path)
         path = parsed.path.rstrip("/") or "/"
-        if method == "GET" and path == "/":
-            html = (BASE_DIR / "web" / "index.html").read_bytes()
+        if method == "GET" and path in {"/", "/chair"}:
+            name = "index.html" if path == "/" else "chair.html"
+            html = (BASE_DIR / "web" / name).read_bytes()
             self.send_response(200)
             self.send_header("Content-Type", "text/html; charset=utf-8")
             self.send_header("Content-Length", str(len(html)))
@@ -440,6 +391,9 @@ class ReviewHandler(BaseHTTPRequestHandler):
             paper_id = int(parts[2])
             if len(parts) == 3 and method == "GET":
                 return self._send(200, store.get_paper(self._user_id(), paper_id))
+            if len(parts) == 4 and parts[3] == "review-period" and method == "POST":
+                data = self._body()
+                return self._send(200, store.set_review_period(self._user_id(), paper_id, data.get("start", ""), data.get("end", "")))
             if len(parts) == 4 and parts[3] == "bids" and method == "POST":
                 data = self._body()
                 return self._send(201, store.bid(self._user_id(), paper_id, data.get("interest", ""), data.get("note", "")))
@@ -457,6 +411,17 @@ class ReviewHandler(BaseHTTPRequestHandler):
                 return self._send(201, store.decide(self._user_id(), paper_id, data.get("decision", ""), data.get("note", "")))
             if len(parts) == 4 and parts[3] == "history" and method == "GET":
                 return self._send(200, {"items": store.history(self._user_id(), paper_id)})
+        if parts == ["api", "chair", "backfill"] and method == "GET":
+            return self._send(200, store.backfill_overview(self._user_id()))
+        if parts == ["api", "busy-intervals"]:
+            if method == "GET":
+                reviewer_id = parse_qs(parsed.query).get("reviewer_id", [None])[0]
+                return self._send(200, {"items": store.list_busy_intervals(self._user_id(), reviewer_id)})
+            if method == "POST":
+                data = self._body()
+                return self._send(201, store.add_busy_interval(self._user_id(), data.get("start", ""), data.get("end", ""), data.get("reason", "")))
+        if len(parts) == 3 and parts[:2] == ["api", "busy-intervals"] and method == "DELETE":
+            return self._send(200, store.delete_busy_interval(self._user_id(), int(parts[2])))
         if len(parts) == 4 and parts[:2] == ["api", "assignments"] and method == "POST":
             assignment_id = int(parts[2])
             data = self._body()
