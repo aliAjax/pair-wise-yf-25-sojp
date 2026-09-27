@@ -1,0 +1,97 @@
+<!doctype html>
+<html lang="zh-CN"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1"><title>主席工作台 · 评审分配</title>
+<style>
+body{font:16px system-ui;max-width:1080px;margin:32px auto;padding:0 16px}
+input,textarea,select,button{font:inherit;padding:8px;margin:4px}
+.grid{display:grid;grid-template-columns:1fr 2fr;gap:16px}
+.panel{border:1px solid #bbb;padding:16px;border-radius:8px;margin-bottom:16px}
+table{border-collapse:collapse;width:100%}td,th{border:1px solid #ddd;padding:6px 8px;text-align:left;vertical-align:top}
+.badge{display:inline-block;padding:1px 8px;border-radius:10px;background:#eee;font-size:13px}
+.bad{background:#fde2e2}.ok{background:#e2f5e2}.warn{background:#fff3cd}
+.reason{color:#a33;font-size:13px;margin:2px 0}
+pre{white-space:pre-wrap;background:#f4f4f4;padding:12px}
+li{cursor:pointer}li.sel{font-weight:bold}
+</style></head>
+<body>
+<h1>主席工作台 · 评审分配</h1>
+<p>以主席身份操作（<code>X-User-Id: chair</code>）。为每篇论文设定评审起止；只有能全程覆盖且未满负载的评审人才能被邀请。
+评审人登记冲突休假后，相关分配自动失效并释放名额，待补位论文会出现在左侧列表。<a href="/">返回首页</a></p>
+<div class="grid">
+<div>
+  <section class="panel"><h2>待补位论文</h2>
+    <button onclick="loadAttention()">刷新</button>
+    <ul id="attention"></ul>
+  </section>
+  <section class="panel"><h2>选择论文</h2>
+    <input id="pid" type="number" min="1" placeholder="论文 ID" style="width:8em">
+    <button onclick="loadDetail()">查看</button>
+  </section>
+</div>
+<div>
+  <section class="panel" id="detailPanel" style="display:none">
+    <h2 id="dtitle"></h2>
+    <p>状态：<span class="badge" id="dstatus"></span>
+       评审起止：<span id="dwindow"></span></p>
+    <h3>设定评审起止</h3>
+    <input id="wstart" type="datetime-local"> 至 <input id="wend" type="datetime-local">
+    <button onclick="setWindow()">保存</button>
+    <h3>当前分配</h3>
+    <table><thead><tr><th>评审人</th><th>状态</th><th>评分</th></tr></thead><tbody id="dassign"></tbody></table>
+    <h3>可邀请候选</h3>
+    <table><thead><tr><th>评审人</th><th>负载</th><th></th></tr></thead><tbody id="deligible"></tbody></table>
+    <h3>被排除候选及原因</h3>
+    <table><thead><tr><th>评审人</th><th>排除原因</th></tr></thead><tbody id="dexcluded"></tbody></table>
+  </section>
+  <section class="panel"><h2>操作结果</h2><pre id="out">（暂无）</pre></section>
+</div>
+</div>
+<script>
+const headers={"Content-Type":"application/json","X-User-Id":"chair"};
+async function api(url,opt={}){const r=await fetch(url,{...opt,headers});const j=await r.json();if(!r.ok)throw j;return j}
+function show(x){out.textContent=typeof x==="string"?x:JSON.stringify(x,null,2)}
+async function guard(fn){try{await fn()}catch(e){show(e.error?`${e.error.code}: ${e.error.message}`:String(e))}}
+function esc(s){return String(s).replace(/[&<>"]/g,c=>({"&":"&amp;","<":"&lt;",">":"&gt;",'"':"&quot;"}[c]))}
+
+async function loadAttention(){guard(async()=>{
+  const j=await api("/api/chair/attention");
+  attention.innerHTML=j.items.map(p=>
+    `<li onclick="pick(${p.id})" data-pid="${p.id}">#${p.id} ${esc(p.title)} <span class="badge warn">${p.status}</span><br><small>${p.review_start?`${p.review_start} ~ ${p.review_end}`:"未设评审起止"}</small></li>`
+  ).join("")||"<li>（无）</li>";
+})}
+function pick(id){pid.value=id;loadDetail()}
+
+async function loadDetail(){guard(async()=>{
+  const id=Number(pid.value); if(!id){show("请输入论文 ID");return}
+  const j=await api(`/api/papers/${id}/chair-detail`);
+  detailPanel.style.display="";
+  dtitle.textContent=`#${j.paper.id} ${j.paper.title}`;
+  dstatus.textContent=j.paper.status;
+  dwindow.textContent=j.paper.review_start?`${j.paper.review_start} ~ ${j.paper.review_end}`:"（未设定）";
+  dassign.innerHTML=j.assignments.map(a=>{
+    const cls=a.status==="invalidated"?"bad":(a.status==="accepted"||a.status==="completed")?"ok":"";
+    const inv=a.invalidated_by?`（因休假 #${a.invalidated_by} 失效，名额已释放）`:"";
+    return `<tr><td>${esc(a.reviewer_id)}</td><td><span class="badge ${cls}">${a.status}</span>${inv}</td><td>${a.score??""}</td></tr>`;
+  }).join("")||`<tr><td colspan="3">（无）</td></tr>`;
+  deligible.innerHTML=j.candidates.eligible.map(c=>
+    `<tr><td>${esc(c.id)} ${esc(c.name)}</td><td>${c.load}/${c.load_limit}</td><td><button onclick="invite('${esc(c.id)}')">邀请</button></td></tr>`
+  ).join("")||`<tr><td colspan="3">（暂无可邀请候选）</td></tr>`;
+  dexcluded.innerHTML=Object.entries(j.candidates.excluded).map(([rid,rs])=>
+    `<tr><td>${esc(rid)}</td><td>${rs.map(r=>`<div class="reason">[${r.code}] ${esc(r.message)}</div>`).join("")}</td></tr>`
+  ).join("")||`<tr><td colspan="2">（无）</td></tr>`;
+  document.querySelectorAll("#attention li").forEach(li=>li.classList.toggle("sel",Number(li.dataset.pid)===id));
+})}
+
+async function setWindow(){guard(async()=>{
+  const id=Number(pid.value);
+  const j=await api(`/api/papers/${id}/review-window`,{method:"POST",body:JSON.stringify({start:wstart.value,end:wend.value})});
+  show(j); await loadDetail(); await loadAttention();
+})}
+
+async function invite(rid){guard(async()=>{
+  const id=Number(pid.value);
+  const j=await api(`/api/papers/${id}/assignments`,{method:"POST",body:JSON.stringify({reviewer_id:rid})});
+  show(j); await loadDetail(); await loadAttention();
+})}
+
+loadAttention();
+</script></body></html>
